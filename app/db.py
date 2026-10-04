@@ -8,13 +8,20 @@
 snapshots 记录，留存当时的标题、事件、“先于”关系输入，与该版本的推算结果
 一一对应。旧库中只有 computations、没有 snapshots 的历史版本视为不可回看、
 不可恢复，列表中明确标记，绝不用当前输入冒充。
+
+事件持续身份：events.identity 在事件首次保存时生成，之后随保存、改名、
+恢复一路沿用（客户端以 id_<旧行号> 引用 live 行时继承该行身份），并写入
+快照。跨版本对照只按 identity 配对事件，不按名称或会重建的行号猜配；
+缺身份的旧快照不做逐事件差值，仅展示各版本原貌。
 """
 
 import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime
 
+import compare
 import compute
 
 LEGACY_REASON = "历史版本缺少完整输入快照，不可回看、不可恢复"
@@ -35,7 +42,8 @@ CREATE TABLE IF NOT EXISTS events (
     earliest_start  TEXT,                          -- ISO 分钟精度，可空（暂存）
     latest_start    TEXT,
     duration_minutes INTEGER,
-    note            TEXT NOT NULL DEFAULT ''
+    note            TEXT NOT NULL DEFAULT '',
+    identity        TEXT                           -- 事件持续身份：跨保存/改名/恢复不变
 );
 CREATE TABLE IF NOT EXISTS relations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -79,6 +87,21 @@ class LegacyVersion(Exception):
     """旧库历史版本：有推算记录但缺少完整输入快照，不可回看/恢复。"""
 
 
+class VersionNotComparable(Exception):
+    """旧库历史版本：有推算记录但缺少完整输入快照，无法参与对照。"""
+    def __init__(self, version):
+        super().__init__("version {} lacks input snapshot".format(version))
+        self.version = version
+
+
+class InvalidVersionOrder(Exception):
+    """对照顺序无效：较早版本号必须小于较晚版本号。"""
+    def __init__(self, from_version, to_version):
+        super().__init__("invalid compare order")
+        self.from_version = from_version
+        self.to_version = to_version
+
+
 class VersionConflict(Exception):
     def __init__(self, current_version):
         super().__init__("stale version")
@@ -91,6 +114,11 @@ class FinalizeRejected(Exception):
 
 def _now():
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _new_identity():
+    """生成事件持续身份：首次保存/旧数据补发时使用，之后一路沿用。"""
+    return "e_" + uuid.uuid4().hex[:12]
 
 
 def init_db(db_path):
@@ -108,10 +136,12 @@ def init_db(db_path):
 
 
 def _migrate(conn):
-    """老库结构升级（幂等）：relations 补充“先于”间隔设置列。
+    """老库结构升级（幂等）：relations 补充“先于”间隔设置列；
+    events 补充持续身份列（跨版本对照的配对依据）。
 
     升级前已存在的关系行由列默认值得到 最短等待=0、最长等待=NULL（不限），
-    与旧语义“前项结束不晚于后项开始”完全一致。
+    与旧语义“前项结束不晚于后项开始”完全一致。存量 live 事件行补发新身份；
+    历史快照中的事件没有身份，对照时按原貌展示，不做逐事件差值。
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(relations)")}
     if "min_gap_minutes" not in cols:
@@ -119,6 +149,12 @@ def _migrate(conn):
             "ALTER TABLE relations ADD COLUMN min_gap_minutes INTEGER NOT NULL DEFAULT 0")
     if "max_gap_minutes" not in cols:
         conn.execute("ALTER TABLE relations ADD COLUMN max_gap_minutes INTEGER")
+    event_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "identity" not in event_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN identity TEXT")
+        for row in conn.execute("SELECT id FROM events").fetchall():
+            conn.execute("UPDATE events SET identity=? WHERE id=?",
+                         (_new_identity(), row[0]))
 
 
 def connect(db_path):
@@ -238,8 +274,41 @@ def list_versions(db_path, review_id):
         conn.close()
 
 
+def _version_detail(conn, review_id, version, legacy_exc=LegacyVersion):
+    """某版本的完整回看内容：不可变输入 + 当时推算依据 + 状态。
+
+    版本不存在抛 VersionNotFound；缺快照的旧库版本抛 legacy_exc
+    （回看/恢复用 LegacyVersion，对照用 VersionNotComparable）。
+    """
+    comp = conn.execute(
+        "SELECT * FROM computations WHERE review_id=? AND review_version=?",
+        (review_id, version)).fetchone()
+    if comp is None:
+        raise VersionNotFound(version)
+    snap = conn.execute(
+        "SELECT * FROM snapshots WHERE review_id=? AND review_version=?",
+        (review_id, version)).fetchone()
+    if snap is None:
+        raise legacy_exc(version)
+    saved_input = json.loads(snap["input_json"])
+    return {
+        "version": version,
+        "state": "finalized" if snap["kind"] == "finalize" else "draft",
+        "kind": snap["kind"],
+        "reviewable": True,
+        "restorable": True,
+        "title": snap["title"],
+        "source_version": snap["source_version"],
+        "created_at": snap["created_at"],
+        "status": comp["status"],
+        "computed_at": comp["computed_at"],
+        "input": saved_input,
+        "result": json.loads(comp["result_json"]),
+    }
+
+
 def get_version(db_path, review_id, version):
-    """返回某版本的完整回看内容：不可变输入 + 当时推算依据 + 状态。
+    """返回某版本的完整回看内容。
 
     旧库缺少输入快照的版本抛 LegacyVersion；版本不存在抛 VersionNotFound。
     """
@@ -248,31 +317,43 @@ def get_version(db_path, review_id, version):
         review = conn.execute("SELECT id FROM reviews WHERE id=?", (review_id,)).fetchone()
         if review is None:
             raise NotFound(review_id)
-        comp = conn.execute(
-            "SELECT * FROM computations WHERE review_id=? AND review_version=?",
-            (review_id, version)).fetchone()
-        if comp is None:
-            raise VersionNotFound(version)
-        snap = conn.execute(
-            "SELECT * FROM snapshots WHERE review_id=? AND review_version=?",
-            (review_id, version)).fetchone()
-        if snap is None:
-            raise LegacyVersion(version)
-        saved_input = json.loads(snap["input_json"])
-        return {
-            "version": version,
-            "state": "finalized" if snap["kind"] == "finalize" else "draft",
-            "kind": snap["kind"],
-            "reviewable": True,
-            "restorable": True,
-            "title": snap["title"],
-            "source_version": snap["source_version"],
-            "created_at": snap["created_at"],
-            "status": comp["status"],
-            "computed_at": comp["computed_at"],
-            "input": saved_input,
-            "result": json.loads(comp["result_json"]),
-        }
+        return _version_detail(conn, review_id, version)
+    finally:
+        conn.close()
+
+
+def _version_meta(v):
+    return {k: v.get(k) for k in (
+        "version", "state", "kind", "title", "status", "computed_at",
+        "created_at", "source_version")}
+
+
+def compare_versions(db_path, review_id, from_version, to_version):
+    """只读对照同一复盘的较早（from）与较晚（to）两个版本，不写任何表。
+
+    顺序无效（from >= to）抛 InvalidVersionOrder；版本不存在抛
+    VersionNotFound；旧库缺快照的版本抛 VersionNotComparable。
+    事件按持续身份（identity）配对，缺可靠身份的旧快照只做原貌展示。
+    """
+    if from_version >= to_version:
+        raise InvalidVersionOrder(from_version, to_version)
+    conn = connect(db_path)
+    try:
+        review = conn.execute(
+            "SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if review is None:
+            raise NotFound(review_id)
+        from_v = _version_detail(conn, review_id, from_version,
+                                 legacy_exc=VersionNotComparable)
+        to_v = _version_detail(conn, review_id, to_version,
+                               legacy_exc=VersionNotComparable)
+        diff = compare.diff_versions(from_v, to_v)
+        return dict({
+            "review_id": review_id,
+            "current_version": review["version"],
+            "from": _version_meta(from_v),
+            "to": _version_meta(to_v),
+        }, **diff)
     finally:
         conn.close()
 
@@ -342,6 +423,7 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
     key_by_id = {e["id"]: "id_" + str(e["id"]) for e in events}
     snapshot_events = [{
         "key": key_by_id[e["id"]],
+        "identity": e.get("identity"),
         "name": e["name"],
         "earliest_start": e["earliest_start"],
         "latest_start": e["latest_start"],
@@ -359,16 +441,31 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
 
 
 def _replace_input(conn, review_id, events, relations):
-    """整体替换 live 输入表。events 用客户端 key，relations 用 key 引用。"""
+    """整体替换 live 输入表。events 用客户端 key，relations 用 key 引用。
+
+    事件持续身份（identity）：恢复来的事件自带 identity 则沿用；
+    否则若 key 指向本次替换前的 live 行（id_<行号>）则继承该行身份；
+    其余（全新事件、无身份旧快照恢复）分配新身份。同一次替换内身份唯一，
+    重复的 incoming 身份视为新事件另发身份，绝不按名称猜配。
+    """
+    old = conn.execute(
+        "SELECT id, identity FROM events WHERE review_id=?", (review_id,)).fetchall()
+    identity_by_key = {"id_" + str(r["id"]): r["identity"] for r in old if r["identity"]}
     conn.execute("DELETE FROM events WHERE review_id=?", (review_id,))
     conn.execute("DELETE FROM relations WHERE review_id=?", (review_id,))
     key_to_id = {}
+    used_identities = set()
     for e in events:
+        identity = e.get("identity") or identity_by_key.get(e.get("key")) \
+            or _new_identity()
+        if identity in used_identities:
+            identity = _new_identity()
+        used_identities.add(identity)
         cur = conn.execute(
             "INSERT INTO events (review_id, name, earliest_start, latest_start,"
-            " duration_minutes, note) VALUES (?,?,?,?,?,?)",
+            " duration_minutes, note, identity) VALUES (?,?,?,?,?,?,?)",
             (review_id, e["name"], e.get("earliest_start"), e.get("latest_start"),
-             e.get("duration_minutes"), e.get("note", "")))
+             e.get("duration_minutes"), e.get("note", ""), identity))
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
         min_gap = r.get("min_gap_minutes")

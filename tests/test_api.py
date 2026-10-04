@@ -11,6 +11,7 @@
 import json
 import os
 import pathlib
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -256,6 +257,84 @@ def test_draft_relation_skipped_with_reason():
     s = res["skipped_relations"][0]
     assert "暂存" in s["reason"]
     assert s["min_gap_minutes"] == 5
+
+
+def test_compare_endpoint():
+    # v2：两事件一关系（间隔 10~60）；v3：告警改名、间隔改 20、新增事件
+    status, bundle = req("POST", "/api/reviews", {"title": "对照复盘"})
+    assert status == 201
+    rid = bundle["review"]["id"]
+    status, bundle = req("PUT", "/api/reviews/{}".format(rid), {
+        "base_version": 1, "title": "对照复盘",
+        "events": [ev("a", "告警", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+                   ev("b", "响应", "2026-10-01T10:00", "2026-10-01T12:00", 30)],
+        "relations": [rel("a", "b", min_g=10, max_g=60)]})
+    assert status == 200, bundle
+    keys = {e["name"]: "id_" + str(e["id"]) for e in bundle["events"]}
+    status, bundle = req("PUT", "/api/reviews/{}".format(rid), {
+        "base_version": 2, "title": "对照复盘·改",
+        "events": [ev(keys["告警"], "告警触发", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+                   ev(keys["响应"], "响应", "2026-10-01T10:00", "2026-10-01T12:00", 30),
+                   ev("c", "复盘会议", "2026-10-01T13:00", "2026-10-01T14:00", 60)],
+        "relations": [rel(keys["告警"], keys["响应"], min_g=20, max_g=60)]})
+    assert status == 200, bundle
+
+    status, cmp = req("GET", "/api/reviews/{}/compare?from=2&to=3".format(rid))
+    assert status == 200, cmp
+    assert cmp["pairable"] is True
+    assert cmp["review_id"] == rid and cmp["current_version"] == 3
+    assert cmp["from"]["version"] == 2 and cmp["to"]["version"] == 3
+    assert cmp["title"] == {"from": "对照复盘", "to": "对照复盘·改", "changed": True}
+    # 改名按持续身份识别，不是删除+新增
+    assert [r["to_name"] for r in cmp["events"]["renamed"]] == ["告警触发"]
+    assert [e["name"] for e in cmp["events"]["added"]] == ["复盘会议"]
+    assert cmp["events"]["removed"] == []
+    # 关系间隔变化
+    gc = cmp["relations"]["gap_changed"]
+    assert len(gc) == 1
+    assert gc[0]["from"]["min_gap_minutes"] == 10 and gc[0]["to"]["min_gap_minutes"] == 20
+    assert gc[0]["predecessor"]["name"] == "告警触发"  # 端点名称取较晚版本
+    # 只读：当前输入、版本与推算未被对照修改
+    _, cur = req("GET", "/api/reviews/{}".format(rid))
+    assert cur["review"]["version"] == 3 and cur["review"]["title"] == "对照复盘·改"
+    assert len(cur["events"]) == 3 and len(cur["relations"]) == 1
+
+
+def test_compare_endpoint_errors():
+    status, bundle = req("POST", "/api/reviews", {"title": "对照错误"})
+    rid = bundle["review"]["id"]
+    status, _ = req("PUT", "/api/reviews/{}".format(rid), {
+        "base_version": 1, "title": "对照错误",
+        "events": [ev("a", "A", "2026-10-01T10:00", "2026-10-01T11:00", 10)],
+        "relations": []})
+    assert status == 200
+
+    # 缺参数 / 非整数 → 400
+    for suffix in ("/compare", "/compare?from=1", "/compare?from=x&to=2"):
+        s, resp = req("GET", "/api/reviews/{}{}".format(rid, suffix))
+        assert s == 400, (suffix, resp)
+        assert "error" in resp
+    # 顺序无效 → 400
+    s, resp = req("GET", "/api/reviews/{}/compare?from=2&to=1".format(rid))
+    assert s == 400 and "顺序" in resp["error"]
+    s, resp = req("GET", "/api/reviews/{}/compare?from=2&to=2".format(rid))
+    assert s == 400 and "顺序" in resp["error"]
+    # 版本不存在 → 404
+    s, resp = req("GET", "/api/reviews/{}/compare?from=1&to=99".format(rid))
+    assert s == 404 and "版本" in resp["error"]
+    # 复盘不存在 → 404
+    s, resp = req("GET", "/api/reviews/9999/compare?from=1&to=2".format(rid))
+    assert s == 404
+    # 旧库缺快照的版本 → 422 并说明无法比较
+    conn = sqlite3.connect(server.DB_PATH)
+    conn.execute("DELETE FROM snapshots WHERE review_id=? AND review_version=1", (rid,))
+    conn.commit()
+    conn.close()
+    s, resp = req("GET", "/api/reviews/{}/compare?from=1&to=2".format(rid))
+    assert s == 422 and "无法参与对照" in resp["error"], resp
+    # 只读：上述对照请求均未推进版本
+    _, cur = req("GET", "/api/reviews/{}".format(rid))
+    assert cur["review"]["version"] == 2
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

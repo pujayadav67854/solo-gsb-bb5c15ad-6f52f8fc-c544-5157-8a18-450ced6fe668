@@ -420,6 +420,33 @@ async function loadVersions() {
     }
     tbody.appendChild(tr);
   }
+  fillCompareSelects(data);
+}
+
+/* 对照下拉框：只有可回看（有快照）的版本能参与对照；旧库缺快照版本禁用并注明 */
+function fillCompareSelects(data) {
+  const fromSel = $("#compare-from"), toSel = $("#compare-to");
+  const prevFrom = fromSel.value, prevTo = toSel.value;
+  fromSel.innerHTML = "";
+  toSel.innerHTML = "";
+  for (const v of data.versions) {
+    const label = `v${v.version}` + (v.reviewable ? "" : "（缺快照，不可对照）");
+    for (const sel of [fromSel, toSel]) {
+      const opt = document.createElement("option");
+      opt.value = v.version;
+      opt.textContent = label;
+      if (!v.reviewable) opt.disabled = true;
+      sel.appendChild(opt);
+    }
+  }
+  const reviewable = data.versions.filter((v) => v.reviewable).map((v) => v.version);
+  if (reviewable.length) {
+    fromSel.value = prevFrom && reviewable.includes(Number(prevFrom))
+      ? prevFrom : String(Math.min(...reviewable));
+    toSel.value = prevTo && reviewable.includes(Number(prevTo))
+      ? prevTo : String(Math.max(...reviewable));
+  }
+  $("#btn-compare").disabled = reviewable.length < 2;
 }
 
 function kindTag(v) {
@@ -519,6 +546,200 @@ async function restoreVersion(detail) {
   }
 }
 
+/* ------------------------------------------------------------ 版本对照（只读） */
+
+const INPUT_FIELD_LABELS = {
+  earliest_start: "最早开始", latest_start: "最晚开始",
+  duration_minutes: "持续(分钟)", note: "备注",
+};
+const WINDOW_FIELD_LABELS = {
+  earliest_start: "可行窗口·最早开始", latest_start: "可行窗口·最晚开始",
+  earliest_end: "可行结束·最早", latest_end: "可行结束·最晚",
+};
+
+function statusWord(s) { return s === "ok" ? "通过" : s === "conflict" ? "冲突" : (s || "—"); }
+
+function kindWord(k) {
+  return k === "finalize" ? "定稿" : k === "restore" ? "恢复产生"
+    : k === "save" ? "保存" : "历史记录";
+}
+
+function fmtCompareVal(field, v) {
+  if (v === null || v === undefined || v === "") return "—";
+  if (field.indexOf("start") >= 0 || field.indexOf("end") >= 0) {
+    return String(v).replace("T", " ");
+  }
+  return String(v);
+}
+
+function changeRowsHtml(labels, changes) {
+  return Object.keys(changes).map((f) => {
+    const ch = changes[f];
+    return `<div class="chg-line"><span class="chg-field">${labels[f] || f}</span>` +
+      `<span class="chg-from">${escapeHtml(fmtCompareVal(f, ch.from))}</span>` +
+      ` → <span class="chg-to">${escapeHtml(fmtCompareVal(f, ch.to))}</span></div>`;
+  }).join("");
+}
+
+function relGapShort(g) {
+  const parts = [];
+  if (g.min_gap_minutes) parts.push(`最短等待 ${g.min_gap_minutes} 分钟`);
+  if (g.max_gap_minutes !== null && g.max_gap_minutes !== undefined) {
+    parts.push(`最长等待 ${g.max_gap_minutes} 分钟`);
+  }
+  return parts.length ? `（${parts.join("，")}）` : "（无间隔限制）";
+}
+
+function relLabelHtml(r) {
+  return `「${escapeHtml(r.predecessor.name || "?")}」先于「${escapeHtml(r.successor.name || "?")}」`;
+}
+
+function compareEventCard(ev, tag, cls) {
+  const i = ev.input || {};
+  const dur = i.duration_minutes === null || i.duration_minutes === undefined
+    ? "—" : i.duration_minutes;
+  let win;
+  if (ev.draft) {
+    win = "暂存：不参与推算，无可行窗口";
+  } else if (ev.window) {
+    win = "可行窗口 " + fmtCompareVal("earliest_start", ev.window.earliest_start) +
+      " ~ " + fmtCompareVal("latest_start", ev.window.latest_start);
+  } else {
+    win = "无可行窗口";
+  }
+  return `<div class="card ${cls}"><h3><span class="diff-tag">${tag}</span>「${escapeHtml(ev.name)}」</h3>` +
+    `<div class="hint">最早 ${escapeHtml(fmtCompareVal("earliest_start", i.earliest_start))}` +
+    `｜最晚 ${escapeHtml(fmtCompareVal("latest_start", i.latest_start))}` +
+    `｜持续 ${escapeHtml(String(dur))} 分钟` +
+    (i.note ? `｜备注：${escapeHtml(i.note)}` : "") + `</div>` +
+    `<div class="hint">${escapeHtml(win)}</div></div>`;
+}
+
+function changedEventCard(c) {
+  let html = `<div class="card diff-changed"><h3>「${escapeHtml(c.to_name)}」` +
+    (c.renamed ? ` <span class="diff-tag">改名：${escapeHtml(c.from_name)} → ${escapeHtml(c.to_name)}</span>` : "") +
+    `</h3>`;
+  if (Object.keys(c.input_changes).length) {
+    html += `<div class="chg-title">输入变化</div>${changeRowsHtml(INPUT_FIELD_LABELS, c.input_changes)}`;
+  }
+  if (Object.keys(c.window_changes).length) {
+    html += `<div class="chg-title">推算可行窗口变化</div>${changeRowsHtml(WINDOW_FIELD_LABELS, c.window_changes)}`;
+  }
+  if (c.draft_change) {
+    html += `<div class="chg-line"><span class="chg-field">暂存状态</span>` +
+      `${c.draft_change.from ? "暂存" : "参与推算"} → ${c.draft_change.to ? "暂存" : "参与推算"}</div>`;
+  }
+  return html + `</div>`;
+}
+
+function conflictCard(c, tag, cls) {
+  const evs = (c.events || []).map((e) => "「" + escapeHtml(e.name || "?") + "」").join("");
+  return `<div class="card ${cls}"><div><span class="diff-tag">${tag}</span>${escapeHtml(c.message || "")}</div>` +
+    (evs ? `<div class="hint">涉及：${evs}</div>` : "") + `</div>`;
+}
+
+function renderCompareDiff(d) {
+  const ev = d.events, rel = d.relations, cf = d.conflicts, dr = d.drafts;
+  let html = `<div class="section-title">概要</div><div class="card">`;
+  html += `<div>标题：${d.title.changed
+    ? escapeHtml(d.title.from) + " → <b>" + escapeHtml(d.title.to) + "</b>"
+    : escapeHtml(d.title.to || "") + "（未变）"}</div>`;
+  html += `<div>推算状态：${statusWord(d.status.from)} → ${statusWord(d.status.to)}${d.status.changed ? "" : "（未变）"}</div>`;
+  html += `<div>事件：新增 ${ev.added.length} · 删除 ${ev.removed.length} · 改名 ${ev.renamed.length}` +
+    ` · 输入/窗口变化 ${ev.changed.length} · 未变 ${ev.unchanged_count}</div>`;
+  html += `<div>“先于”关系：新增 ${rel.added.length} · 删除 ${rel.removed.length} · 间隔变化 ${rel.gap_changed.length}</div>`;
+  html += `<div>冲突：v${d.from.version} 时 ${cf.from.length} 处 → v${d.to.version} 时 ${cf.to.length} 处` +
+    `（新增 ${cf.new.length} · 消除 ${cf.resolved.length}）</div>`;
+  html += `<div>暂存：v${d.from.version} 时 ${dr.from.length} 个 → v${d.to.version} 时 ${dr.to.length} 个` +
+    `（新增暂存 ${dr.new.length} · 解除暂存 ${dr.resolved.length}）</div>`;
+  html += `</div>`;
+
+  if (ev.added.length) {
+    html += `<div class="section-title">新增事件（${ev.added.length}）</div>` +
+      ev.added.map((e) => compareEventCard(e, "新增", "diff-added")).join("");
+  }
+  if (ev.removed.length) {
+    html += `<div class="section-title">删除事件（${ev.removed.length}）</div>` +
+      ev.removed.map((e) => compareEventCard(e, "删除", "diff-removed")).join("");
+  }
+  if (ev.renamed.length) {
+    html += `<div class="section-title">改名事件（${ev.renamed.length}）</div>` +
+      ev.renamed.map((r) => `<div class="card diff-changed"><div>「${escapeHtml(r.from_name)}」 → ` +
+        `「${escapeHtml(r.to_name)}」 <span class="hint">（同一事件，按持续身份配对）</span></div></div>`).join("");
+  }
+  if (ev.changed.length) {
+    html += `<div class="section-title">输入 / 可行窗口变化（${ev.changed.length}）</div>` +
+      ev.changed.map(changedEventCard).join("");
+  }
+  if (rel.added.length || rel.removed.length || rel.gap_changed.length) {
+    html += `<div class="section-title">“先于”关系变化</div>`;
+    html += rel.added.map((r) => `<div class="card diff-added"><div><span class="diff-tag">新增</span>` +
+      `${relLabelHtml(r)}${escapeHtml(relGapShort(r))}</div></div>`).join("");
+    html += rel.removed.map((r) => `<div class="card diff-removed"><div><span class="diff-tag">删除</span>` +
+      `${relLabelHtml(r)}${escapeHtml(relGapShort(r))}</div></div>`).join("");
+    html += rel.gap_changed.map((r) => `<div class="card diff-changed"><div><span class="diff-tag">间隔变化</span>` +
+      `${relLabelHtml(r)}<br><span class="chg-from">${escapeHtml(relGapShort(r.from))}</span>` +
+      ` → <span class="chg-to">${escapeHtml(relGapShort(r.to))}</span></div></div>`).join("");
+  }
+  html += `<div class="section-title">冲突变化</div>`;
+  if (cf.new.length || cf.resolved.length) {
+    html += cf.new.map((c) => conflictCard(c, "新增冲突", "diff-removed")).join("");
+    html += cf.resolved.map((c) => conflictCard(c, "已消除", "diff-added")).join("");
+  } else {
+    html += `<div class="hint">两版本冲突集合一致（v${d.from.version}：${cf.from.length} 处，` +
+      `v${d.to.version}：${cf.to.length} 处）。</div>`;
+  }
+  if (dr.new.length || dr.resolved.length) {
+    html += `<div class="section-title">暂存状态变化</div>`;
+    html += dr.new.map((x) => `<div class="card draft"><div><span class="diff-tag">新增暂存</span>` +
+      `「${escapeHtml(x.name)}」<div class="reason">${escapeHtml(x.reason || "")}</div></div></div>`).join("");
+    html += dr.resolved.map((x) => `<div class="card diff-added"><div><span class="diff-tag">解除暂存</span>` +
+      `「${escapeHtml(x.name)}」</div></div>`).join("");
+  }
+  return html;
+}
+
+/* 缺可靠身份的旧快照：不虚构逐事件差值，左右并排展示各版本原貌 */
+function renderCompareRaw(d) {
+  const side = (meta, snap) =>
+    `<div class="compare-col"><h3>v${meta.version} ${escapeHtml(meta.title || "")}</h3>` +
+    renderVersionDetail({ input: snap.input, result: snap.result }) + `</div>`;
+  return `<div class="summary warn">${escapeHtml(d.reason)}</div>` +
+    `<div class="compare-cols">${side(d.from, d.from_snapshot)}${side(d.to, d.to_snapshot)}</div>`;
+}
+
+async function openCompare() {
+  if (!state.current) return;
+  const from = Number($("#compare-from").value);
+  const to = Number($("#compare-to").value);
+  if (!from || !to) {
+    showBanner("⚠ 请选择要对照的较早与较晚两个版本");
+    return;
+  }
+  if (from >= to) {
+    showBanner("⚠ 对照顺序无效：较早版本必须小于较晚版本");
+    return;
+  }
+  let d;
+  try {
+    d = await api("GET", `/api/reviews/${state.current.review.id}/compare?from=${from}&to=${to}`);
+  } catch (err) {
+    showBanner("⚠ " + escapeHtml(err.message || "对照失败"));
+    return;
+  }
+  $("#cm-title").textContent = `版本对照：v${d.from.version} → v${d.to.version}`;
+  $("#cm-meta").textContent =
+    `v${d.from.version}（${kindWord(d.from.kind)}·推算${statusWord(d.from.status)}） → ` +
+    `v${d.to.version}（${kindWord(d.to.kind)}·推算${statusWord(d.to.status)}）` +
+    `　|　只读对照，不影响当前输入、版本与定稿状态`;
+  $("#cm-body").innerHTML = d.pairable ? renderCompareDiff(d) : renderCompareRaw(d);
+  $("#compare-modal").classList.remove("hidden");
+}
+
+function closeCompareModal() {
+  $("#compare-modal").classList.add("hidden");
+}
+
 /* ---------------------------------------------------------------- 事件绑定 */
 
 $("#btn-new").addEventListener("click", async () => {
@@ -545,6 +766,11 @@ $("#btn-refresh").addEventListener("click", () => {
 
 $("#btn-reload-versions").addEventListener("click", () => {
   if (state.current) loadVersions();
+});
+$("#btn-compare").addEventListener("click", openCompare);
+$("#btn-cm-close").addEventListener("click", closeCompareModal);
+$("#compare-modal").addEventListener("click", (e) => {
+  if (e.target.id === "compare-modal") closeCompareModal();
 });
 $("#btn-vm-close").addEventListener("click", closeVersionModal);
 $("#version-modal").addEventListener("click", (e) => {

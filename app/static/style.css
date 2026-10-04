@@ -132,7 +132,27 @@ summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 .modal-head { display: flex; align-items: center; gap: 10px; }
 .vm-title { font-size: 16px; font-weight: 600; }
 .modal-head #btn-vm-close { margin-left: auto; }
+.modal-head #btn-cm-close { margin-left: auto; }
 .modal-body { margin-top: 10px; max-height: none; }
 .modal-foot { margin-top: 14px; display: flex; justify-content: flex-end; }
 #vm-body table input { pointer-events: none; }
 .vm-relations { color: var(--muted); font-size: 13px; line-height: 1.9; }
+
+/* 版本对照 */
+.compare-bar { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
+.compare-bar .hint { margin: 0; }
+.compare-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+.compare-col h3 { margin: 0 0 8px; font-size: 14px; }
+@media (max-width: 900px) { .compare-cols { grid-template-columns: 1fr; } }
+.diff-tag {
+  font-size: 11px; padding: 1px 7px; border-radius: 9px; margin-right: 6px;
+  border: 1px solid var(--border); color: var(--muted);
+}
+.card.diff-added { border-color: var(--ok); }
+.card.diff-removed { border-color: var(--err); }
+.card.diff-changed { border-color: var(--accent); }
+.chg-title { color: var(--muted); font-size: 12px; margin: 8px 0 4px; }
+.chg-line { font-size: 12px; margin: 2px 0; }
+.chg-field { color: var(--muted); margin-right: 8px; }
+.chg-from { color: var(--warn); }
+.chg-to { color: var(--ok); }

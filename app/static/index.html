@@ -70,6 +70,14 @@
       <button id="btn-reload-versions" title="重新加载版本列表">刷新版本</button>
     </div>
     <p class="hint">每次保存或定稿都会留存不可变的标题、事件与“先于”关系输入快照。恢复会把旧版本输入另存为当前复盘的新草稿版本并重新推算，不会覆盖任何旧版本。</p>
+    <div class="compare-bar">
+      <span class="hint">版本对照：</span>
+      <select id="compare-from" title="较早版本"></select>
+      <span>→</span>
+      <select id="compare-to" title="较晚版本"></select>
+      <button id="btn-compare">对照两个版本</button>
+      <span class="hint">只读对照：查看事件增删改、可行窗口、关系间隔、冲突与暂存的变化，不影响当前输入与定稿状态</span>
+    </div>
     <table id="versions-table">
       <thead>
         <tr>
@@ -80,6 +88,17 @@
     </table>
   </section>
 </main>
+
+<div id="compare-modal" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <span id="cm-title" class="vm-title"></span>
+      <button id="btn-cm-close" title="关闭">✕</button>
+    </div>
+    <div id="cm-meta" class="hint"></div>
+    <div id="cm-body" class="modal-body"></div>
+  </div>
+</div>
 
 <div id="version-modal" class="modal-mask hidden">
   <div class="modal">

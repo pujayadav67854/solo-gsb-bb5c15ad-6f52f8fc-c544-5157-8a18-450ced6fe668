@@ -12,6 +12,7 @@
   GET    /api/reviews/{id}/versions       可回看版本列表（含不可回看的旧库历史版本标记）
   GET    /api/reviews/{id}/versions/{v}   某版本回看：当时输入 + 推算依据 + 状态
   POST   /api/reviews/{id}/versions/{v}/restore  恢复为新草稿版本 {base_version}
+  GET    /api/reviews/{id}/compare?from={v1}&to={v2}  两版本只读对照（v1 早于 v2）
   DELETE /api/reviews/{id}        删除复盘
 
 并发控制：所有修改请求必须携带 base_version，与服务器当前版本一致才接受，
@@ -24,6 +25,7 @@ import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import db
 
@@ -254,6 +256,24 @@ class Handler(BaseHTTPRequestHandler):
                 db.restore_review(DB_PATH, rid, body["base_version"], ver)
                 return self._send_json(200, db.get_bundle(DB_PATH, rid))
 
+            m = re.fullmatch(r"/api/reviews/(\d+)/compare", path)
+            if m and method == "GET":
+                rid = int(m.group(1))
+                query = parse_qs(urlsplit(self.path).query)
+
+                def _version_param(name):
+                    raw = query.get(name, [None])[0]
+                    if raw is None:
+                        raise ApiError(400, "缺少查询参数 {}（较早/较晚两个版本号）".format(name))
+                    try:
+                        return int(raw)
+                    except ValueError:
+                        raise ApiError(400, "查询参数 {} 必须是整数版本号".format(name))
+
+                from_v = _version_param("from")
+                to_v = _version_param("to")
+                return self._send_json(200, db.compare_versions(DB_PATH, rid, from_v, to_v))
+
             raise ApiError(404, "not found")
         except ApiError as e:
             self._send_json(e.status, e.payload)
@@ -264,6 +284,17 @@ class Handler(BaseHTTPRequestHandler):
         except db.LegacyVersion:
             self._send_json(422, {"error": db.LEGACY_REASON,
                                   "reviewable": False, "restorable": False})
+        except db.VersionNotComparable as e:
+            self._send_json(422, {
+                "error": "版本 v{} 缺少完整输入快照（旧库历史版本），无法参与对照".format(
+                    e.version),
+                "version": e.version,
+            })
+        except db.InvalidVersionOrder as e:
+            self._send_json(400, {
+                "error": "对照顺序无效：较早版本 from（v{}）必须小于较晚版本 to（v{}）".format(
+                    e.from_version, e.to_version),
+            })
         except db.VersionConflict as e:
             self._send_json(409, {
                 "error": "该复盘已被其他成员保存了更新的版本，你的修改未保存，请刷新后重试",

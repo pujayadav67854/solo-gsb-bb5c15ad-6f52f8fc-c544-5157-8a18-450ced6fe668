@@ -21,6 +21,12 @@
   网页和 HTTP API 可列出各版本、回看当时输入与推算依据；把指定版本恢复时会
   **另存为当前复盘的新草稿版本**并重新推算，不覆盖任何旧版本。恢复须携带当前
   `base_version`，版本过期沿用 409 冲突语义。冲突或暂存输入允许恢复，但仍不得定稿。
+- **跨版本对照（只读）**：选择同一复盘中较早/较晚两个版本，对照事件的**新增、删除、
+  改名**、输入时间范围与**推算可行窗口**的变化，以及“先于”关系**间隔**、**冲突**与
+  **暂存状态**的变化。事件按**持续身份**（`identity`，首次保存时生成，随保存/改名/
+  恢复一路沿用）跨版本配对，绝不按名称或会随保存重建的行号猜配。旧库缺快照的版本
+  明确报错无法比较；有快照但缺可靠身份的旧事件只展示各版本原貌，不虚构逐事件差值。
+  对照不修改当前输入、版本号与定稿状态。
 - **旧库历史版本**：升级前只有推算结果、缺少完整输入快照的历史版本，会在版本列表中
   明确标记为「不可回看、不可恢复」，不会用当前输入冒充；老接口行为保持不变。
 - **冲突处理**：约束冲突时保留全部输入，指出冲突事件及双方依据链（正推最早可行开始
@@ -72,7 +78,8 @@ python3 app/server.py          # 默认监听 8000，数据库写入 ./data/time
 PORT=9000 DB_PATH=/tmp/t.db python3 app/server.py
 python3 tests/test_compute.py  # 推算引擎单元测试（含间隔上下界）
 python3 tests/test_versions.py # 版本快照/回看/恢复、旧库兼容单元测试
-python3 tests/test_api.py      # HTTP API 端到端测试（间隔校验、409、恢复保留间隔）
+python3 tests/test_compare.py  # 跨版本对照单元测试（持续身份配对、只读、旧快照原貌）
+python3 tests/test_api.py      # HTTP API 端到端测试（间隔校验、409、恢复保留间隔、对照接口）
 ```
 
 ## HTTP API 简介
@@ -87,6 +94,7 @@ python3 tests/test_api.py      # HTTP API 端到端测试（间隔校验、409�
 | GET | `/api/reviews/{id}/versions` | 版本列表（含回看/恢复标记；旧库无快照版本 `reviewable=false`） |
 | GET | `/api/reviews/{id}/versions/{v}` | 版本回看：当时标题/事件/关系输入 + 推算依据与状态；旧库无快照返回 422 |
 | POST | `/api/reviews/{id}/versions/{v}/restore` | 恢复为新草稿版本 `{base_version}`；过期返回 409，旧库无快照返回 422 |
+| GET | `/api/reviews/{id}/compare?from={v1}&to={v2}` | 两版本只读对照（v1 早于 v2）；顺序无效 400，版本不存在 404，旧库无快照 422 |
 | DELETE | `/api/reviews/{id}` | 删除复盘 |
 
 ### 版本回看与恢复（HTTP 示例）
@@ -120,6 +128,62 @@ curl -s -X POST http://localhost:8000/api/reviews/1/versions/3/restore \
 链，可直接**恢复为新草稿版本**）；旧库无快照版本只显示不可回看、不可恢复的原因。
 定稿产生的新版本会标注「已定稿」并沿用同一输入；由恢复产生的版本标注「恢复产生」并
 记录来源版本。
+
+### 跨版本对照（本轮新增，HTTP 示例）
+
+`GET /api/reviews/{id}/compare?from={较早版本}&to={较晚版本}` 只读对照同一复盘的
+两个版本，不修改当前输入、版本号与定稿状态。事件按**持续身份**配对：每个事件首次
+保存时生成 `identity`，之后随保存、改名、恢复一路沿用并写入快照——改名或恢复后的
+事件仍被识别为同一事件，绝不按名称或会随保存重建的行号猜配。
+
+```bash
+# 1) 对照 v2 → v3：事件增删改、输入时间范围与推算可行窗口、关系间隔、
+#    冲突与暂存状态的变化一次返回
+curl -s "http://localhost:8000/api/reviews/1/compare?from=2&to=3"
+# {"review_id": 1, "current_version": 3, "pairable": true,
+#  "from": {"version": 2, "kind": "save", "state": "draft", "title": "...", "status": "ok", ...},
+#  "to":   {"version": 3, ...},
+#  "title":  {"from": "...", "to": "...", "changed": true},
+#  "status": {"from": "ok", "to": "ok", "changed": false},
+#  "events": {
+#    "added":   [{"identity": "e_...", "name": "复盘会议", "input": {...}, "window": {...}, "draft": false}],
+#    "removed": [{"identity": "e_...", "name": "...", ...}],
+#    "renamed": [{"identity": "e_...", "from_name": "告警", "to_name": "告警触发"}],
+#    "changed": [{"identity": "e_...", "renamed": true,
+#                 "input_changes":  {"earliest_start": {"from": "2026-10-01T10:00", "to": "2026-10-01T10:05"}},
+#                 "window_changes": {"earliest_start": {"from": "2026-10-01T10:00", "to": "2026-10-01T10:05"}},
+#                 "draft_change": null, ...}],
+#    "unchanged_count": 1},
+#  "relations": {
+#    "added": [...], "removed": [...],
+#    "gap_changed": [{"predecessor": {"identity": "e_...", "name": "告警触发"}, "successor": {...},
+#                     "from": {"min_gap_minutes": 10, "max_gap_minutes": 60},
+#                     "to":   {"min_gap_minutes": 20, "max_gap_minutes": 60}}]},
+#  "conflicts": {"from": [...], "to": [...], "new": [...], "resolved": [...]},
+#  "drafts":    {"from": [...], "to": [...], "new": [...], "resolved": [...]}}
+
+# 2) 明确报错：顺序无效（from >= to）→ 400；版本不存在 → 404；
+#    旧库缺快照的版本 → 422 并说明无法比较
+curl -s "http://localhost:8000/api/reviews/1/compare?from=3&to=2"
+# 400 {"error": "对照顺序无效：较早版本 from（v3）必须小于较晚版本 to（v2）"}
+curl -s "http://localhost:8000/api/reviews/1/compare?from=2&to=99"
+# 404 {"error": "该版本不存在"}
+curl -s "http://localhost:8000/api/reviews/1/compare?from=1&to=2"
+# 422 {"error": "版本 v1 缺少完整输入快照（旧库历史版本），无法参与对照", "version": 1}
+
+# 3) 有快照但缺可靠身份的旧版本（升级前保存）：pairable=false，
+#    只展示各版本原貌（from_snapshot / to_snapshot），不虚构逐事件差值
+curl -s "http://localhost:8000/api/reviews/1/compare?from=2&to=3"
+# {"pairable": false,
+#  "reason": "版本 v2 的输入快照缺少可靠的事件身份标识（升级前保存的旧快照），
+#             无法按事件持续身份配对；以下仅展示各版本原貌，不提供逐事件差值。",
+#  "from_snapshot": {"input": {...}, "result": {...}},
+#  "to_snapshot":   {"input": {...}, "result": {...}}, ...}
+```
+
+页面「历史版本」面板上方的**版本对照**下拉选择较早/较晚两个版本（缺快照的旧版本
+置灰不可选），点击「对照两个版本」弹窗展示上述差异；缺可靠身份时并排展示两版原貌。
+保存、回看、恢复接口行为不变，保存与恢复仍沿用 `base_version` 过期返回 409 的约定。
 
 ### “先于”关系的间隔设置（HTTP 示例）
 
@@ -220,12 +284,14 @@ curl -s -X PUT http://localhost:8000/api/reviews/1 \
 
 ```
 app/
-  server.py          HTTP 服务（标准库 http.server）、间隔设置校验
-  db.py              SQLite 持久化、乐观锁、启动时建表与老库迁移
+  server.py          HTTP 服务（标准库 http.server）、间隔设置校验、对照接口参数校验
+  db.py              SQLite 持久化、乐观锁、事件持续身份、启动时建表与老库迁移
   compute.py         时间窗推算与依据链生成（含间隔上下界传播）
+  compare.py         跨版本对照：按事件持续身份配对，产出差异视图（纯函数）
   static/            浏览器单页界面（原生 HTML/JS/CSS）
 tests/test_compute.py  推算引擎单元测试
 tests/test_versions.py 版本快照/回看/恢复与旧库兼容测试
+tests/test_compare.py  跨版本对照单元测试
 tests/test_api.py      HTTP API 端到端测试
 Dockerfile / docker-compose.yml / .dockerignore
 ```
