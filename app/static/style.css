@@ -131,8 +131,25 @@ summary { cursor: pointer; color: var(--muted); font-size: 12px; }
 }
 .modal-head { display: flex; align-items: center; gap: 10px; }
 .vm-title { font-size: 16px; font-weight: 600; }
-.modal-head #btn-vm-close { margin-left: auto; }
+.modal-head #btn-vm-close, .modal-head #btn-cm-close { margin-left: auto; }
 .modal-body { margin-top: 10px; max-height: none; }
 .modal-foot { margin-top: 14px; display: flex; justify-content: flex-end; }
 #vm-body table input { pointer-events: none; }
 .vm-relations { color: var(--muted); font-size: 13px; line-height: 1.9; }
+
+/* 版本对照 */
+.compare-bar {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  margin: 8px 0 12px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel2);
+}
+.compare-bar label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.compare-bar .hint { margin: 0; }
+.cmp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; align-items: start; }
+@media (max-width: 760px) { .cmp-grid { grid-template-columns: 1fr; } }
+.cmp-col { min-width: 0; }
+table.cmp { margin: 6px 0; font-size: 12px; }
+table.cmp th, table.cmp td { padding: 4px 6px; }
+.card.diff-add { border-color: var(--ok); }
+.card.diff-del { border-color: var(--err); }
+.card.diff-rename { border-color: var(--warn); }

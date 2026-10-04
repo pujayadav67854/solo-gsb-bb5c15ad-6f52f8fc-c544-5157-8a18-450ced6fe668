@@ -13,11 +13,14 @@ snapshots 记录，留存当时的标题、事件、“先于”关系输入，�
 import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime
 
+import compare
 import compute
 
 LEGACY_REASON = "历史版本缺少完整输入快照，不可回看、不可恢复"
+LEGACY_COMPARE_REASON = "历史版本缺少完整输入快照，无法比较"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS reviews (
@@ -35,7 +38,8 @@ CREATE TABLE IF NOT EXISTS events (
     earliest_start  TEXT,                          -- ISO 分钟精度，可空（暂存）
     latest_start    TEXT,
     duration_minutes INTEGER,
-    note            TEXT NOT NULL DEFAULT ''
+    note            TEXT NOT NULL DEFAULT '',
+    uid             TEXT                           -- 跨版本持续身份，保存/恢复时沿用
 );
 CREATE TABLE IF NOT EXISTS relations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -89,8 +93,17 @@ class FinalizeRejected(Exception):
     pass
 
 
+class InvalidCompareOrder(Exception):
+    """版本对照的较早/较晚顺序无效（须 from_version < to_version）。"""
+
+
 def _now():
     return datetime.now().isoformat(timespec="seconds")
+
+
+def _new_uid():
+    """生成事件持续身份：跨保存、改名、恢复保持稳定，与行号无关。"""
+    return uuid.uuid4().hex
 
 
 def init_db(db_path):
@@ -108,17 +121,25 @@ def init_db(db_path):
 
 
 def _migrate(conn):
-    """老库结构升级（幂等）：relations 补充“先于”间隔设置列。
+    """老库结构升级（幂等）：relations 补充“先于”间隔设置列；events 补充持续身份列。
 
     升级前已存在的关系行由列默认值得到 最短等待=0、最长等待=NULL（不限），
-    与旧语义“前项结束不晚于后项开始”完全一致。
+    与旧语义“前项结束不晚于后项开始”完全一致。升级前已存在的事件行现场
+    补发 uid，此后的保存即可沿用身份；已写入的旧快照不含 uid，对照时按
+    “缺可靠身份”处理，只展示原貌，不回填、不猜配。
     """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(relations)")}
     if "min_gap_minutes" not in cols:
         conn.execute(
             "ALTER TABLE relations ADD COLUMN min_gap_minutes INTEGER NOT NULL DEFAULT 0")
     if "max_gap_minutes" not in cols:
-        conn.execute("ALTER TABLE relations ADD COLUMN max_gap_minutes INTEGER")
+        conn.execute(
+            "ALTER TABLE relations ADD COLUMN max_gap_minutes INTEGER")
+    event_cols = {row[1] for row in conn.execute("PRAGMA table_info(events)")}
+    if "uid" not in event_cols:
+        conn.execute("ALTER TABLE events ADD COLUMN uid TEXT")
+        for (eid,) in conn.execute("SELECT id FROM events WHERE uid IS NULL").fetchall():
+            conn.execute("UPDATE events SET uid=? WHERE id=?", (_new_uid(), eid))
 
 
 def connect(db_path):
@@ -238,6 +259,35 @@ def list_versions(db_path, review_id):
         conn.close()
 
 
+def _version_snapshot(conn, review_id, version):
+    """读取某版本的不可变输入快照与当时推算结果。
+
+    版本号不存在抛 VersionNotFound；旧库缺少输入快照的版本抛 LegacyVersion。
+    """
+    comp = conn.execute(
+        "SELECT * FROM computations WHERE review_id=? AND review_version=?",
+        (review_id, version)).fetchone()
+    if comp is None:
+        raise VersionNotFound(version)
+    snap = conn.execute(
+        "SELECT * FROM snapshots WHERE review_id=? AND review_version=?",
+        (review_id, version)).fetchone()
+    if snap is None:
+        raise LegacyVersion(version)
+    return {
+        "version": version,
+        "state": "finalized" if snap["kind"] == "finalize" else "draft",
+        "kind": snap["kind"],
+        "title": snap["title"],
+        "source_version": snap["source_version"],
+        "created_at": snap["created_at"],
+        "status": comp["status"],
+        "computed_at": comp["computed_at"],
+        "input": json.loads(snap["input_json"]),
+        "result": json.loads(comp["result_json"]),
+    }
+
+
 def get_version(db_path, review_id, version):
     """返回某版本的完整回看内容：不可变输入 + 当时推算依据 + 状态。
 
@@ -248,33 +298,36 @@ def get_version(db_path, review_id, version):
         review = conn.execute("SELECT id FROM reviews WHERE id=?", (review_id,)).fetchone()
         if review is None:
             raise NotFound(review_id)
-        comp = conn.execute(
-            "SELECT * FROM computations WHERE review_id=? AND review_version=?",
-            (review_id, version)).fetchone()
-        if comp is None:
-            raise VersionNotFound(version)
-        snap = conn.execute(
-            "SELECT * FROM snapshots WHERE review_id=? AND review_version=?",
-            (review_id, version)).fetchone()
-        if snap is None:
-            raise LegacyVersion(version)
-        saved_input = json.loads(snap["input_json"])
-        return {
-            "version": version,
-            "state": "finalized" if snap["kind"] == "finalize" else "draft",
-            "kind": snap["kind"],
-            "reviewable": True,
-            "restorable": True,
-            "title": snap["title"],
-            "source_version": snap["source_version"],
-            "created_at": snap["created_at"],
-            "status": comp["status"],
-            "computed_at": comp["computed_at"],
-            "input": saved_input,
-            "result": json.loads(comp["result_json"]),
-        }
+        data = _version_snapshot(conn, review_id, version)
+        data["reviewable"] = True
+        data["restorable"] = True
+        return data
     finally:
         conn.close()
+
+
+def compare_versions(db_path, review_id, from_version, to_version):
+    """对照同一复盘的较早（from）与较晚（to）两个版本，返回只读差值视图。
+
+    不改当前输入、版本号与定稿状态。顺序无效（from >= to）抛
+    InvalidCompareOrder；版本不存在抛 VersionNotFound；旧库缺快照的版本
+    抛 LegacyVersion；快照缺可靠事件身份时按原貌展示（pairable=False）。
+    """
+    if from_version >= to_version:
+        raise InvalidCompareOrder(
+            "较早版本必须小于较晚版本（from={} 不早于 to={}）".format(from_version, to_version))
+    conn = connect(db_path)
+    try:
+        review = conn.execute("SELECT id FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if review is None:
+            raise NotFound(review_id)
+        from_data = _version_snapshot(conn, review_id, from_version)
+        to_data = _version_snapshot(conn, review_id, to_version)
+    finally:
+        conn.close()
+    result = compare.build_compare(from_data, to_data)
+    result["review_id"] = review_id
+    return result
 
 
 # ---------------------------------------------------------------------- 写入
@@ -316,6 +369,7 @@ def _current_input(conn, review_id):
     key_by_id = {e["id"]: "id_" + str(e["id"]) for e in events}
     snapshot_events = [{
         "key": key_by_id[e["id"]],
+        "uid": e.get("uid"),
         "name": e["name"],
         "earliest_start": e["earliest_start"],
         "latest_start": e["latest_start"],
@@ -342,6 +396,7 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
     key_by_id = {e["id"]: "id_" + str(e["id"]) for e in events}
     snapshot_events = [{
         "key": key_by_id[e["id"]],
+        "uid": e.get("uid"),
         "name": e["name"],
         "earliest_start": e["earliest_start"],
         "latest_start": e["latest_start"],
@@ -359,16 +414,25 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
 
 
 def _replace_input(conn, review_id, events, relations):
-    """整体替换 live 输入表。events 用客户端 key，relations 用 key 引用。"""
+    """整体替换 live 输入表。events 用客户端 key，relations 用 key 引用。
+
+    每个事件可携带 uid（持续身份）：携带且未重复时沿用，否则现场分配新
+    uid。行号每次保存都会重建，只有 uid 能跨版本识别同一事件。
+    """
     conn.execute("DELETE FROM events WHERE review_id=?", (review_id,))
     conn.execute("DELETE FROM relations WHERE review_id=?", (review_id,))
     key_to_id = {}
+    used_uids = set()
     for e in events:
+        uid = e.get("uid") or None
+        if not uid or uid in used_uids:
+            uid = _new_uid()
+        used_uids.add(uid)
         cur = conn.execute(
             "INSERT INTO events (review_id, name, earliest_start, latest_start,"
-            " duration_minutes, note) VALUES (?,?,?,?,?,?)",
+            " duration_minutes, note, uid) VALUES (?,?,?,?,?,?,?)",
             (review_id, e["name"], e.get("earliest_start"), e.get("latest_start"),
-             e.get("duration_minutes"), e.get("note", "")))
+             e.get("duration_minutes"), e.get("note", ""), uid))
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
         min_gap = r.get("min_gap_minutes")
@@ -377,6 +441,26 @@ def _replace_input(conn, review_id, events, relations):
             " min_gap_minutes, max_gap_minutes) VALUES (?,?,?,?,?)",
             (review_id, key_to_id[r["predecessor_key"]], key_to_id[r["successor_key"]],
              0 if min_gap is None else min_gap, r.get("max_gap_minutes")))
+
+
+def _resolve_event_uids(conn, review_id, events):
+    """保存前解析每个事件的持续身份（uid）。
+
+    客户端回传的 uid 属于本复盘当前事件且未重复时沿用（改名、调整时间
+    后仍是同一事件）；否则（新事件、未知或伪造的 uid）分配新 uid。
+    绝不按名称或会重建的行号猜配。
+    """
+    rows = conn.execute(
+        "SELECT uid FROM events WHERE review_id=?", (review_id,)).fetchall()
+    known = {r["uid"] for r in rows if r["uid"]}
+    used = set()
+    for e in events:
+        uid = e.get("uid")
+        if uid and uid in known and uid not in used:
+            e["uid"] = uid
+        else:
+            e["uid"] = _new_uid()
+        used.add(e["uid"])
 
 
 def update_review(db_path, review_id, base_version, title, events, relations):
@@ -390,6 +474,7 @@ def update_review(db_path, review_id, base_version, title, events, relations):
         if row["version"] != base_version:
             raise VersionConflict(row["version"])
 
+        _resolve_event_uids(conn, review_id, events)
         _replace_input(conn, review_id, events, relations)
         live_events, live_relations, _, _ = _current_input(conn, review_id)
 

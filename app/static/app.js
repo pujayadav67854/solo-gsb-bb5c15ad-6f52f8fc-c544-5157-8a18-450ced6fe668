@@ -68,6 +68,7 @@ function resetEdits() {
   state.editEvents = b.events.map((e) => ({
     key: "id_" + e.id,
     id: e.id,
+    uid: e.uid || "",   // 事件持续身份：保存时回传，跨版本对照按它配对
     name: e.name,
     earliest_start: e.earliest_start || "",
     latest_start: e.latest_start || "",
@@ -337,6 +338,7 @@ async function save() {
     title: $("#review-title").value.trim(),
     events: state.editEvents.map((e) => ({
       key: e.key,
+      uid: e.uid || "",
       name: e.name,
       earliest_start: e.earliest_start || null,
       latest_start: e.latest_start || null,
@@ -420,6 +422,26 @@ async function loadVersions() {
     }
     tbody.appendChild(tr);
   }
+  fillCompareSelects(data.versions, data.current_version);
+}
+
+/* 对照下拉框：只有具备输入快照的版本可参与对照；旧库缺快照版本禁选并标注 */
+function fillCompareSelects(versions, currentVersion) {
+  const fromSel = $("#compare-from"), toSel = $("#compare-to");
+  const asc = [...versions].sort((a, b) => a.version - b.version);
+  const opts = asc.map((v) => {
+    const label = `v${v.version}` + (v.reviewable ? "" : "（缺快照不可对照）");
+    return `<option value="${v.version}"${v.reviewable ? "" : " disabled"}>${label}</option>`;
+  }).join("");
+  fromSel.innerHTML = opts;
+  toSel.innerHTML = opts;
+  const reviewable = asc.filter((v) => v.reviewable).map((v) => v.version);
+  const toDefault = reviewable.includes(currentVersion)
+    ? currentVersion : reviewable[reviewable.length - 1];
+  const earlier = reviewable.filter((v) => v < toDefault);
+  fromSel.value = earlier.length ? earlier[earlier.length - 1] : toDefault;
+  toSel.value = toDefault;
+  $("#btn-compare").disabled = reviewable.length < 2;
 }
 
 function kindTag(v) {
@@ -519,6 +541,178 @@ async function restoreVersion(detail) {
   }
 }
 
+/* ------------------------------------------------------------ 版本对照 */
+
+async function openCompare() {
+  if (!state.current) return;
+  const from = parseInt($("#compare-from").value, 10);
+  const to = parseInt($("#compare-to").value, 10);
+  try {
+    const data = await api(
+      "GET", `/api/reviews/${state.current.review.id}/compare?from=${from}&to=${to}`);
+    hideBanner();
+    renderCompareModal(data);
+  } catch (err) {
+    // 顺序无效(400)、版本不存在(404)、旧库缺快照(422)等明确报错
+    showBanner("⚠ 版本对照失败：" + escapeHtml(err.message || "未知错误"));
+  }
+}
+
+function closeCompareModal() { $("#compare-modal").classList.add("hidden"); }
+
+function fmtVal(v) { return v === null || v === undefined || v === "" ? "—" : escapeHtml(String(v)); }
+function fmtWin(w) {
+  if (!w) return "—（暂存，无推算窗口）";
+  return `${w.earliest_start.replace("T", " ")} ~ ${w.latest_start.replace("T", " ")}`;
+}
+function fmtGap(g) {
+  const parts = [];
+  if (g.min_gap_minutes) parts.push(`最短等待 ${g.min_gap_minutes} 分钟`);
+  if (g.max_gap_minutes !== null && g.max_gap_minutes !== undefined) {
+    parts.push(`最长等待 ${g.max_gap_minutes} 分钟`);
+  }
+  return parts.length ? `（${parts.join("，")}）` : "（未设间隔）";
+}
+
+const INPUT_FIELD_LABELS = {
+  earliest_start: "最早开始", latest_start: "最晚开始",
+  duration_minutes: "持续分钟数", note: "备注",
+};
+const WINDOW_FIELD_LABELS = {
+  earliest_start: "最早可行开始", latest_start: "最晚可行开始",
+  earliest_end: "最早可行结束", latest_end: "最晚可行结束",
+};
+
+function changeRows(changes, labels, isTime) {
+  return Object.keys(changes).map((f) => {
+    const c = changes[f];
+    const fmt = isTime ? (v) => fmtVal(v).replace("T", " ") : fmtVal;
+    return `<tr><td>${labels[f] || f}</td><td>${fmt(c.from)}</td><td>${fmt(c.to)}</td></tr>`;
+  }).join("");
+}
+
+function renderCompareModal(data) {
+  $("#cm-title").textContent = `版本对照：v${data.from.version} → v${data.to.version}`;
+  const meta = [
+    `标题：「${data.from.title}」→「${data.to.title}」${data.title_changed ? "（已变更）" : "（未变）"}`,
+    `推算状态：${data.from.status} → ${data.to.status}`,
+    `定稿状态：${data.from.state === "finalized" ? "已定稿" : "草稿"} → ` +
+      `${data.to.state === "finalized" ? "已定稿" : "草稿"}`,
+  ];
+  $("#cm-meta").textContent = meta.join("　|　");
+  $("#cm-body").innerHTML = data.pairable ? compareDiffHtml(data) : compareRawHtml(data);
+  $("#compare-modal").classList.remove("hidden");
+}
+
+/* 缺可靠身份的旧快照：只展示各版本原貌，不展示逐事件差值 */
+function compareRawHtml(data) {
+  const side = (label, v) => {
+    const detail = { input: v.input, result: v.result };
+    return `<div class="cmp-col"><div class="section-title">${label}（v${v.version}）原貌</div>` +
+      renderVersionDetail(detail) + `</div>`;
+  };
+  return `<div class="summary warn">⚠ ${escapeHtml(data.reason)}</div>` +
+    `<div class="cmp-grid">${side("较早版本", data.from)}${side("较晚版本", data.to)}</div>`;
+}
+
+function eventBriefHtml(e, tag) {
+  return `<div class="card ${tag}"><h3>「${escapeHtml(e.name)}」` +
+    (e.draft ? ` <span class="badge warn">暂存</span>` : "") + `</h3>` +
+    `<div class="hint">输入范围：${fmtVal(e.earliest_start).replace("T", " ")} ~ ` +
+    `${fmtVal(e.latest_start).replace("T", " ")}` +
+    (e.duration_minutes === null || e.duration_minutes === undefined
+      ? "" : `（持续 ${e.duration_minutes} 分钟）`) + `</div>` +
+    `<div class="hint">推算窗口：${fmtWin(e.window)}</div></div>`;
+}
+
+function compareDiffHtml(data) {
+  const s = data.summary;
+  const ev = data.events;
+  let html = `<div class="summary ok">事件：新增 ${s.events_added}、删除 ${s.events_removed}、` +
+    `改名 ${s.events_renamed}、变化 ${s.events_changed}、未变 ${s.events_unchanged}　|　` +
+    `关系：新增 ${s.relations_added}、删除 ${s.relations_removed}、间隔变化 ${s.relations_changed}　|　` +
+    `冲突 ${s.conflicts_from} → ${s.conflicts_to}　|　暂存 ${s.drafts_from} → ${s.drafts_to}</div>`;
+
+  if (ev.added.length) {
+    html += `<div class="section-title">新增事件</div>` +
+      ev.added.map((e) => eventBriefHtml(e, "diff-add")).join("");
+  }
+  if (ev.removed.length) {
+    html += `<div class="section-title">删除事件</div>` +
+      ev.removed.map((e) => eventBriefHtml(e, "diff-del")).join("");
+  }
+  if (ev.renamed.length) {
+    html += `<div class="section-title">改名事件（同一事件，按持续身份配对）</div>` +
+      ev.renamed.map((r) =>
+        `<div class="card diff-rename">「${escapeHtml(r.from)}」→「${escapeHtml(r.to)}」</div>`).join("");
+  }
+  if (ev.changed.length) {
+    html += `<div class="section-title">输入与推算窗口变化</div>` + ev.changed.map((c) => {
+      let card = `<div class="card"><h3>「${escapeHtml(c.name.from)}」` +
+        (c.name.from !== c.name.to ? ` → 「${escapeHtml(c.name.to)}」` : "") +
+        (c.draft.from !== c.draft.to
+          ? ` <span class="badge warn">${c.draft.to ? "变为暂存" : "已补齐"}</span>` : "") +
+        `</h3>`;
+      const inputRows = changeRows(c.input_changes, INPUT_FIELD_LABELS, true);
+      if (inputRows) {
+        card += `<table class="cmp"><thead><tr><th>输入</th><th>v${data.from.version}</th>` +
+          `<th>v${data.to.version}</th></tr></thead><tbody>${inputRows}</tbody></table>`;
+      }
+      const winRows = changeRows(c.window_changes, WINDOW_FIELD_LABELS, true);
+      if (winRows) {
+        card += `<table class="cmp"><thead><tr><th>推算窗口</th><th>v${data.from.version}</th>` +
+          `<th>v${data.to.version}</th></tr></thead><tbody>${winRows}</tbody></table>`;
+      } else if (c.window.from === null || c.window.to === null) {
+        card += `<div class="hint">推算窗口：${fmtWin(c.window.from)} → ${fmtWin(c.window.to)}</div>`;
+      }
+      return card + `</div>`;
+    }).join("");
+  }
+  if (ev.unchanged.length) {
+    html += `<details><summary>未变化事件（${ev.unchanged.length}）</summary><div class="hint">` +
+      ev.unchanged.map((e) => `「${escapeHtml(e.name)}」`).join("、") + `</div></details>`;
+  }
+
+  const rel = data.relations;
+  if (rel.added.length || rel.removed.length || rel.changed.length) {
+    html += `<div class="section-title">“先于”关系变化</div>`;
+    const relName = (r) =>
+      `「${escapeHtml(r.predecessor.name || "?")}」先于「${escapeHtml(r.successor.name || "?")}」`;
+    html += rel.added.map((r) =>
+      `<div class="card diff-add">＋ ${relName(r)}${escapeHtml(fmtGap(r.to))}</div>`).join("");
+    html += rel.removed.map((r) =>
+      `<div class="card diff-del">－ ${relName(r)}${escapeHtml(fmtGap(r.from))}</div>`).join("");
+    html += rel.changed.map((r) =>
+      `<div class="card diff-rename">△ ${relName(r)}：` +
+      `间隔 ${escapeHtml(fmtGap(r.from))} → ${escapeHtml(fmtGap(r.to))}</div>`).join("");
+  }
+
+  const d = data.drafts;
+  if (d.resolved.length || d.became.length || d.remaining.length) {
+    html += `<div class="section-title">暂存状态变化（${d.from_count} → ${d.to_count}）</div>`;
+    const names = (list) => list.map((e) => `「${escapeHtml(e.name)}」`).join("、");
+    if (d.resolved.length) html += `<div class="card diff-add">已补齐：${names(d.resolved)}</div>`;
+    if (d.became.length) html += `<div class="card diff-del">转为暂存：${names(d.became)}</div>`;
+    if (d.remaining.length) html += `<div class="card">仍为暂存：${names(d.remaining)}</div>`;
+  }
+
+  html += `<div class="section-title">冲突变化（${data.conflicts.from.length} → ` +
+    `${data.conflicts.to.length}）</div>`;
+  const conflictList = (list, label) =>
+    `<div class="cmp-col"><div class="hint">${label}</div>` +
+    (list.length
+      ? list.map((c) => `<div class="card conflict"><div class="msg">⚠ [${escapeHtml(c.type)}] ` +
+          `${escapeHtml(c.message)}</div>` +
+          (c.events.length
+            ? `<div class="hint">涉及：${c.events.map((e) => `「${escapeHtml(e.name)}」`).join("、")}</div>`
+            : "") + `</div>`).join("")
+      : `<div class="hint">无冲突</div>`) + `</div>`;
+  html += `<div class="cmp-grid">` +
+    conflictList(data.conflicts.from, `v${data.from.version}`) +
+    conflictList(data.conflicts.to, `v${data.to.version}`) + `</div>`;
+  return html;
+}
+
 /* ---------------------------------------------------------------- 事件绑定 */
 
 $("#btn-new").addEventListener("click", async () => {
@@ -545,6 +739,11 @@ $("#btn-refresh").addEventListener("click", () => {
 
 $("#btn-reload-versions").addEventListener("click", () => {
   if (state.current) loadVersions();
+});
+$("#btn-compare").addEventListener("click", openCompare);
+$("#btn-cm-close").addEventListener("click", closeCompareModal);
+$("#compare-modal").addEventListener("click", (e) => {
+  if (e.target.id === "compare-modal") closeCompareModal();
 });
 $("#btn-vm-close").addEventListener("click", closeVersionModal);
 $("#version-modal").addEventListener("click", (e) => {

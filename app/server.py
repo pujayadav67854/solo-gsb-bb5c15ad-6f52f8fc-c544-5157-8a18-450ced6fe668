@@ -12,6 +12,7 @@
   GET    /api/reviews/{id}/versions       可回看版本列表（含不可回看的旧库历史版本标记）
   GET    /api/reviews/{id}/versions/{v}   某版本回看：当时输入 + 推算依据 + 状态
   POST   /api/reviews/{id}/versions/{v}/restore  恢复为新草稿版本 {base_version}
+  GET    /api/reviews/{id}/compare?from={v1}&to={v2}  两版本对照（只读，按事件持续身份配对）
   DELETE /api/reviews/{id}        删除复盘
 
 并发控制：所有修改请求必须携带 base_version，与服务器当前版本一致才接受，
@@ -24,6 +25,7 @@ import re
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import db
 
@@ -79,6 +81,7 @@ def validate_event(e):
 
     return {
         "key": str(e.get("key") or ""),
+        "uid": str(e.get("uid") or "")[:64],
         "name": name,
         "earliest_start": norm_time(e.get("earliest_start"), "最早开始时间"),
         "latest_start": norm_time(e.get("latest_start"), "最晚开始时间"),
@@ -254,6 +257,30 @@ class Handler(BaseHTTPRequestHandler):
                 db.restore_review(DB_PATH, rid, body["base_version"], ver)
                 return self._send_json(200, db.get_bundle(DB_PATH, rid))
 
+            m = re.fullmatch(r"/api/reviews/(\d+)/compare", path)
+            if m and method == "GET":
+                rid = int(m.group(1))
+                qs = parse_qs(urlparse(self.path).query)
+
+                def version_param(name):
+                    raw = qs.get(name, [None])[0]
+                    try:
+                        return int(raw)
+                    except (TypeError, ValueError):
+                        raise ApiError(
+                            400, "对照参数 {} 缺失或不是有效版本号".format(name))
+
+                from_v, to_v = version_param("from"), version_param("to")
+                try:
+                    return self._send_json(
+                        200, db.compare_versions(DB_PATH, rid, from_v, to_v))
+                except db.LegacyVersion as e:
+                    return self._send_json(422, {
+                        "error": db.LEGACY_COMPARE_REASON,
+                        "comparable": False,
+                        "version": e.args[0] if e.args else None,
+                    })
+
             raise ApiError(404, "not found")
         except ApiError as e:
             self._send_json(e.status, e.payload)
@@ -269,6 +296,8 @@ class Handler(BaseHTTPRequestHandler):
                 "error": "该复盘已被其他成员保存了更新的版本，你的修改未保存，请刷新后重试",
                 "current_version": e.current_version,
             })
+        except db.InvalidCompareOrder as e:
+            self._send_json(400, {"error": str(e)})
         except db.FinalizeRejected as e:
             self._send_json(400, {"error": str(e)})
 
